@@ -1,13 +1,15 @@
 #![no_std]
 #![no_main]
 
+use defmt::*;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Ticker};
 use panic_probe as _;
 
+use defmt_rtt as _;
+
 use embassy_stm32::{
     gpio::{Input, OutputType, Pull},
-    peripherals,
     time::khz,
     timer::simple_pwm::{PwmPin, SimplePwm},
     Config,
@@ -69,8 +71,11 @@ const PID_DT_MS: u32 = 10; // PID update rate (100 Hz) inside SAMPLE_HZ loop
 // Map PID effort (counts/s error) -> (direction, duty), with cap
 fn duty_from_effort(effort: f32, max: u16, cap_percent: u16) -> (bool, u16) {
     let dir_fwd = effort >= 0.0;
-    let mut duty = (effort.abs() / (CPR_X4 * 50.0) * (max as f32)) as u32;
-    duty = ((duty * (cap_percent as u32)) / 100).min(max as u32);
+    let mut duty = effort.abs() as u32 * 6400 as u32;
+    // let mut duty = (effort.abs() / (CPR_X4 * 50.0) * (max as f32)) as u32;
+    // duty = 60000;
+    // duty = ((duty * (cap_percent as u32)) / 100).min(max as u32);
+    info!("duty is: {}", duty);
     (dir_fwd, duty as u16)
 }
 
@@ -115,7 +120,8 @@ enum Phase {
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(Config::default());
-
+    // // info!("I am here!");
+    //
     // left motor (TIM4: PD12=CH1 RPWM, PD13=CH2 LPWM)
     let left_ch1_pin = PwmPin::new(p.PD12, OutputType::PushPull);
     let left_ch2_pin = PwmPin::new(p.PD13, OutputType::PushPull);
@@ -130,18 +136,21 @@ async fn main(_spawner: Spawner) {
     );
     {
         let mut ch = left_pwm.ch1();
+
         ch.enable();
     }
     {
         let mut ch = left_pwm.ch2();
+
         ch.enable();
     }
     let l_max: u16 = {
         let ch = left_pwm.ch1();
         ch.max_duty_cycle()
     };
+    info!("l_max is: {}", l_max);
     pwm_off!(left_pwm); // start coasting
-
+                        //
     let right_ch1_pin = PwmPin::new(p.PF0, OutputType::PushPull);
     let right_ch2_pin = PwmPin::new(p.PF1, OutputType::PushPull);
     let mut right_pwm = SimplePwm::new(
@@ -159,14 +168,21 @@ async fn main(_spawner: Spawner) {
     }
     {
         let mut ch = right_pwm.ch2();
+
         ch.enable();
     }
     let r_max: u16 = {
         let ch = right_pwm.ch1();
         ch.max_duty_cycle()
     };
+    info!("r_max is: {}", r_max);
     pwm_off!(right_pwm);
-
+    // loop {
+    //     info!("driving forward!");
+    //     pwm_fwd!(right_pwm, 20000);
+    //     pwm_fwd!(left_pwm, 20000);
+    // }
+    //
     let left_a = Input::new(p.PA0, Pull::Up);
     let left_b = Input::new(p.PA1, Pull::Up);
     let mut enc_left = PollEncoder::new(left_a, left_b);
@@ -181,6 +197,7 @@ async fn main(_spawner: Spawner) {
     pid_r.p(1.0, 10.0);
 
     let mut phase = Phase::Forward;
+    info!("moving forward now!");
     let mut phase_remaining_ms: u32 = FWD_TIME_MS;
     let mut target_l: f32 = FWD_CPS;
     let mut target_r: f32 = FWD_CPS;
@@ -195,34 +212,50 @@ async fn main(_spawner: Spawner) {
 
     loop {
         let dl = enc_left.sample_delta();
+        info!("dl: {}", dl);
         let dr = enc_right.sample_delta();
+        info!("dr: {}", dr);
         cps_l = (dl as f32) * (SAMPLE_HZ as f32);
+        info!("cps_l: {}", cps_l);
         cps_r = (dr as f32) * (SAMPLE_HZ as f32);
+        info!("cps_r: {}", cps_r);
 
         pid_accum_ms += period_ms;
         if pid_accum_ms >= PID_DT_MS {
             pid_accum_ms = 0;
 
             let u_l = pid_l.next_control_output(target_l - cps_l).output;
+            info!("u_l is: {}", u_l);
             let u_r = pid_r.next_control_output(target_r - cps_r).output;
+            info!("u_r is: {}", u_r);
 
-            let (fwd_l, duty_l) = duty_from_effort(u_l, l_max, 80);
-            let (fwd_r, duty_r) = duty_from_effort(u_r, r_max, 80);
+            let (fwd_l, duty_l) = duty_from_effort(u_l, l_max, 100);
+            info!("fwd_l, duty_l is: {}", (fwd_l, duty_l));
+            let (fwd_r, duty_r) = duty_from_effort(u_r, r_max, 100);
+            info!("fwd_r, duty_r is: {}", (fwd_r, duty_r));
 
             if u_l.abs() < 1.0 {
                 pwm_off!(left_pwm);
             } else if fwd_l {
-                pwm_fwd!(left_pwm, duty_l)
+                // pwm_fwd!(left_pwm, duty_l)
+
+                pwm_fwd!(left_pwm, 50)
             } else {
-                pwm_rev!(left_pwm, duty_l)
+                // pwm_rev!(left_pwm, duty_l)
+
+                pwm_fwd!(left_pwm, 50)
             }
 
             if u_r.abs() < 1.0 {
                 pwm_off!(right_pwm);
             } else if fwd_r {
-                pwm_fwd!(right_pwm, duty_r)
+                // pwm_fwd!(right_pwm, duty_r)
+
+                pwm_fwd!(right_pwm, 50)
             } else {
-                pwm_rev!(right_pwm, duty_r)
+                // pwm_rev!(right_pwm, duty_r)
+
+                pwm_fwd!(right_pwm, 50)
             }
         }
 
