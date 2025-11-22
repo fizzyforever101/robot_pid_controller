@@ -3,13 +3,16 @@
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Ticker};
+use embassy_stm32::timer::qei::{Ch1, Ch2, Direction, Qei, QeiPin};
+use embassy_time::{Duration, Ticker, Timer};
+use embedded_hal::digital::{Error, InputPin};
 use panic_probe as _;
+use stm32_metapac as pac;
 
 use defmt_rtt as _;
 
 use embassy_stm32::{
-    gpio::{Input, OutputType, Pull},
+    gpio::{Flex, Input, Level, Output, OutputType, Pull, Speed},
     time::khz,
     timer::simple_pwm::{PwmPin, SimplePwm},
     Config,
@@ -58,7 +61,14 @@ macro_rules! pwm_rev {
     }};
 }
 
-const SAMPLE_HZ: u32 = 1000; // encoder polling rate (Hz)
+const PULSES_PER_REV: u32 = 600;
+const WHEEL_DIAMETER_INCHES: f32 = 5.5;
+const INCH_TO_METER: f32 = 0.0254;
+const PI: f32 = 3.14159265359;
+
+const MAX_PWM: u32 = 50000;
+const MIN_PWM: u32 = 30000;
+const SAMPLE_HZ: u32 = 1000; // encoder polling rate (Hz) make this slower
 const CPR_X4: f32 = 600.0 * 4.0; // 2400 counts/rev
 const FWD_CPS: f32 = 4000.0; // forward target cps per wheel
 const REV_CPS: f32 = -4000.0; // reverse target cps per wheel
@@ -69,44 +79,12 @@ const COAST_TIME_MS: u32 = 800;
 const PID_DT_MS: u32 = 10; // PID update rate (100 Hz) inside SAMPLE_HZ loop
 
 // Map PID effort (counts/s error) -> (direction, duty), with cap
-fn duty_from_effort(effort: f32, max: u16, cap_percent: u16) -> (bool, u16) {
-    let dir_fwd = effort >= 0.0;
-    let mut duty = effort.abs() as u32 * 6400 as u32;
-    // let mut duty = (effort.abs() / (CPR_X4 * 50.0) * (max as f32)) as u32;
-    // duty = 60000;
-    // duty = ((duty * (cap_percent as u32)) / 100).min(max as u32);
-    info!("duty is: {}", duty);
-    (dir_fwd, duty as u16)
-}
-
-// State = (A<<1)|B ∈ {00,01,11,10}. LUT maps (prev<<2)|curr → -1/0/1.
-// Forward: 00→10→11→01→00. Reverse: 00→01→11→10→00.
-const QUAD_LUT: [i8; 16] = [0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0];
-
-struct PollEncoder {
-    a: Input<'static>,
-    b: Input<'static>,
-    prev: u8,
-}
-impl PollEncoder {
-    fn new(a: Input<'static>, b: Input<'static>) -> Self {
-        let mut me = Self { a, b, prev: 0 };
-        me.prev = me.state();
-        me
-    }
-    #[inline]
-    fn state(&self) -> u8 {
-        let a = self.a.is_high() as u8;
-        let b = self.b.is_high() as u8;
-        (a << 1) | b
-    }
-    // returns -1/0/1 counts-per-sample
-    fn sample_delta(&mut self) -> i32 {
-        let curr = self.state();
-        let idx = ((self.prev) << 2) | curr;
-        self.prev = curr;
-        QUAD_LUT[idx as usize] as i32
-    }
+fn duty_from_effort(effort: f32) -> u16 {
+    let mut duty = (effort.abs() as u32 * MAX_PWM / 10)
+        .min(MAX_PWM)
+        .max(MIN_PWM);
+    // duty = ((duty * MAX_PWM) / (CPR_X4 as u32 * 10)).min(MAX_PWM);
+    duty as u16
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -120,8 +98,7 @@ enum Phase {
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(Config::default());
-    // // info!("I am here!");
-    //
+
     // left motor (TIM4: PD12=CH1 RPWM, PD13=CH2 LPWM)
     let left_ch1_pin = PwmPin::new(p.PD12, OutputType::PushPull);
     let left_ch2_pin = PwmPin::new(p.PD13, OutputType::PushPull);
@@ -148,9 +125,8 @@ async fn main(_spawner: Spawner) {
         let ch = left_pwm.ch1();
         ch.max_duty_cycle()
     };
-    info!("l_max is: {}", l_max);
-    pwm_off!(left_pwm); // start coasting
-                        //
+    pwm_off!(left_pwm);
+
     let right_ch1_pin = PwmPin::new(p.PF0, OutputType::PushPull);
     let right_ch2_pin = PwmPin::new(p.PF1, OutputType::PushPull);
     let mut right_pwm = SimplePwm::new(
@@ -175,121 +151,270 @@ async fn main(_spawner: Spawner) {
         let ch = right_pwm.ch1();
         ch.max_duty_cycle()
     };
-    info!("r_max is: {}", r_max);
     pwm_off!(right_pwm);
-    // loop {
-    //     info!("driving forward!");
-    //     pwm_fwd!(right_pwm, 20000);
-    //     pwm_fwd!(left_pwm, 20000);
-    // }
-    //
-    let left_a = Input::new(p.PA0, Pull::Up);
-    let left_b = Input::new(p.PA1, Pull::Up);
-    let mut enc_left = PollEncoder::new(left_a, left_b);
 
-    let right_a = Input::new(p.PA6, Pull::Up);
-    let right_b = Input::new(p.PA7, Pull::Up);
-    let mut enc_right = PollEncoder::new(right_a, right_b);
+    let pa6 = QeiPin::new(p.PA6);
+    let pc7 = QeiPin::new(p.PC7);
+    let enc_left = Qei::new(p.TIM3, pa6, pc7);
+    let pe9 = QeiPin::new(p.PE9);
+    let pe11 = QeiPin::new(p.PE11);
+    let enc_right = Qei::new(p.TIM1, pe9, pe11);
 
-    let mut pid_l = Pid::new(100.0, 10.0);
-    pid_l.p(1.0, 10.0);
-    let mut pid_r = Pid::new(100.0, 10.0);
-    pid_r.p(1.0, 10.0);
+    let mut enc_left_prev: u16 = enc_left.count();
+    info!("first enc_left_prev: {}", enc_left_prev);
+    let mut enc_right_prev: u16 = enc_right.count();
 
-    let mut phase = Phase::Forward;
-    info!("moving forward now!");
-    let mut phase_remaining_ms: u32 = FWD_TIME_MS;
-    let mut target_l: f32 = FWD_CPS;
-    let mut target_r: f32 = FWD_CPS;
+    info!("first enc_right_prev: {}", enc_right_prev);
 
-    let mut cps_l: f32 = 0.0;
-    let mut cps_r: f32 = 0.0;
-    let mut pid_accum_ms: u32 = 0;
+    Timer::after(Duration::from_secs(5)).await;
 
-    // 1 kHz loop
-    let period_ms = 1000 / SAMPLE_HZ;
+    let mut enc_left_pos: i32 = 0;
+    let mut enc_right_pos: i32 = 0;
+
+    let period_ms: u32 = 5;
+    let dt_s: f32 = period_ms as f32 / 1000.0;
     let mut tick = Ticker::every(Duration::from_millis(period_ms as u64));
 
+    let wheel_diameter_meters = WHEEL_DIAMETER_INCHES * INCH_TO_METER;
+    let wheel_circumference_meters = PI * wheel_diameter_meters;
+    let ticks_per_meter = PULSES_PER_REV as f32 / wheel_circumference_meters;
+
+    let target_ticks =
+        (wheel_diameter_meters / wheel_circumference_meters) * PULSES_PER_REV as f32 * 4.0;
+    info!("target_ticks: {}", target_ticks);
+
+    let mut pid_left = Pid::new(target_ticks, MAX_PWM as f32);
+    let mut pid_right = Pid::new(target_ticks, MAX_PWM as f32);
+    let mut enc_right_diff: i32 = 0;
+    let mut enc_left_diff: i32 = 0;
+
     loop {
-        let dl = enc_left.sample_delta();
-        info!("dl: {}", dl);
-        let dr = enc_right.sample_delta();
-        info!("dr: {}", dr);
-        cps_l = (dl as f32) * (SAMPLE_HZ as f32);
-        info!("cps_l: {}", cps_l);
-        cps_r = (dr as f32) * (SAMPLE_HZ as f32);
-        info!("cps_r: {}", cps_r);
-
-        pid_accum_ms += period_ms;
-        if pid_accum_ms >= PID_DT_MS {
-            pid_accum_ms = 0;
-
-            let u_l = pid_l.next_control_output(target_l - cps_l).output;
-            info!("u_l is: {}", u_l);
-            let u_r = pid_r.next_control_output(target_r - cps_r).output;
-            info!("u_r is: {}", u_r);
-
-            let (fwd_l, duty_l) = duty_from_effort(u_l, l_max, 100);
-            info!("fwd_l, duty_l is: {}", (fwd_l, duty_l));
-            let (fwd_r, duty_r) = duty_from_effort(u_r, r_max, 100);
-            info!("fwd_r, duty_r is: {}", (fwd_r, duty_r));
-
-            if u_l.abs() < 1.0 {
-                pwm_off!(left_pwm);
-            } else if fwd_l {
-                // pwm_fwd!(left_pwm, duty_l)
-
-                pwm_fwd!(left_pwm, 50)
-            } else {
-                // pwm_rev!(left_pwm, duty_l)
-
-                pwm_fwd!(left_pwm, 50)
-            }
-
-            if u_r.abs() < 1.0 {
-                pwm_off!(right_pwm);
-            } else if fwd_r {
-                // pwm_fwd!(right_pwm, duty_r)
-
-                pwm_fwd!(right_pwm, 50)
-            } else {
-                // pwm_rev!(right_pwm, duty_r)
-
-                pwm_fwd!(right_pwm, 50)
-            }
-        }
-
-        if phase_remaining_ms > 0 {
-            phase_remaining_ms -= period_ms;
-        } else {
-            match phase {
-                Phase::Forward => {
-                    target_l = 0.0;
-                    target_r = 0.0;
-                    phase = Phase::Coast1;
-                    phase_remaining_ms = COAST_TIME_MS;
-                }
-                Phase::Coast1 => {
-                    target_l = REV_CPS;
-                    target_r = REV_CPS;
-                    phase = Phase::Reverse;
-                    phase_remaining_ms = REV_TIME_MS;
-                }
-                Phase::Reverse => {
-                    target_l = 0.0;
-                    target_r = 0.0;
-                    phase = Phase::Coast2;
-                    phase_remaining_ms = COAST_TIME_MS;
-                }
-                Phase::Coast2 => {
-                    target_l = FWD_CPS;
-                    target_r = FWD_CPS;
-                    phase = Phase::Forward;
-                    phase_remaining_ms = FWD_TIME_MS;
-                }
-            }
-        }
-
         tick.next().await;
+
+        const ENCODER_MAX: u16 = 0xFFFF;
+        const THRESHOLD: i32 = 10000;
+
+        let enc_right_raw_now = enc_right.count();
+        let enc_left_raw_now = enc_left.count();
+
+        let enc_right_diff: i32;
+        if enc_right_raw_now as i32 - enc_right_prev as i32 > THRESHOLD {
+            enc_right_diff =
+                (enc_right_raw_now as i32 - ENCODER_MAX as i32 - 1) - enc_right_prev as i32;
+        } else if enc_right_prev as i32 - enc_right_raw_now as i32 > THRESHOLD {
+            enc_right_diff =
+                ((ENCODER_MAX as i32 - enc_right_prev as i32) + enc_right_raw_now as i32 + 1);
+        } else {
+            enc_right_diff = enc_right_raw_now as i32 - enc_right_prev as i32;
+        }
+        enc_right_prev = enc_right_raw_now;
+        enc_right_pos += enc_right_diff.abs();
+        let enc_right_vel = enc_right_diff.abs() as f32 / dt_s;
+
+        let enc_left_diff: i32;
+        if enc_left_raw_now as i32 - enc_left_prev as i32 > THRESHOLD {
+            enc_left_diff =
+                (enc_left_raw_now as i32 - ENCODER_MAX as i32 - 1) - enc_left_prev as i32;
+        } else if enc_left_prev as i32 - enc_left_raw_now as i32 > THRESHOLD {
+            enc_left_diff =
+                ((ENCODER_MAX as i32 - enc_left_prev as i32) + enc_left_raw_now as i32 + 1);
+        } else {
+            enc_left_diff = enc_left_raw_now as i32 - enc_left_prev as i32;
+        }
+        enc_left_prev = enc_left_raw_now;
+        enc_left_pos += enc_left_diff.abs();
+        let enc_left_vel = enc_left_diff.abs() as f32 / dt_s;
+
+        enc_right.reset_count();
+        enc_left.reset_count();
+
+        let enc_right_distance_m = enc_right_pos as f32 / ticks_per_meter;
+        let enc_right_velocity_mps = enc_right_vel / ticks_per_meter;
+        let enc_left_distance_m = enc_left_pos as f32 / ticks_per_meter;
+        let enc_left_velocity_mps = enc_left_vel / ticks_per_meter;
+
+        info!(
+            "enc_right -> now: {}, diff: {}, pos: {}, vel {} ticks/s, distance traveled: {} m, speed: {} m/s",
+            enc_right_raw_now,
+            enc_right_diff,
+            enc_right_pos,
+            enc_right_vel,
+            enc_right_distance_m,
+            enc_right_velocity_mps
+        );
+
+        info!(
+            "enc_left -> now: {}, diff: {}, pos: {}, vel {} ticks/s, distance traveled: {} m, speed: {} m/s",
+            enc_left_raw_now,
+            enc_left_diff,
+            enc_left_pos,
+            enc_left_vel,
+            enc_left_distance_m,
+            enc_left_velocity_mps
+        );
+
+        let effort_left = pid_left
+            .next_control_output(target_ticks - enc_left_pos as f32)
+            .output;
+
+        let effort_right = pid_right
+            .next_control_output(target_ticks - enc_right_pos as f32)
+            .output;
+
+        let duty_left = duty_from_effort(effort_left);
+        let duty_right = duty_from_effort(effort_right);
+
+        pwm_fwd!(left_pwm, duty_left);
+        pwm_fwd!(right_pwm, duty_right);
+
+        if (enc_left_pos as f32 >= target_ticks) && (enc_right_pos as f32 >= target_ticks) {
+            pwm_off!(left_pwm);
+            pwm_off!(right_pwm);
+            info!("done!");
+            break;
+        }
+
+        // loop {
+        //     tick.next().await;
+        //     const ENCODER_MAX: u32 = 0xFFFF;
+        //
+        //     let enc_right_now = enc_right.count();
+        //     let enc_right_diff: i32;
+        //     if (enc_right_now as i32 - enc_right_prev as i32).abs() >= 10000 {
+        //         info!("too big!");
+        //         continue;
+        //     } else {
+        //         enc_right_diff = enc_right_now as i32 - enc_right_prev as i32;
+        //     }
+        //
+        //     // if enc_right_now >= enc_right_prev {
+        //     //     enc_right_diff = enc_right_now as i32 - enc_right_prev as i32;
+        //     // } else {
+        //     //     enc_right_diff =
+        //     //         (enc_right_now as i32) + (ENCODER_MAX as i32 + 1 - enc_right_prev as i32);
+        //     // }
+        //     enc_right_prev = enc_right_now;
+        //     enc_right_pos += enc_right_diff;
+        //     let enc_right_vel = enc_right_diff as f32 / dt_s;
+        //     let enc_right_dir = 1;
+        //
+        //     let enc_right_distance_m = enc_right_pos as f32 / ticks_per_meter;
+        //     let enc_right_velocity_mps = enc_right_vel / ticks_per_meter;
+        //
+        //     // info!(
+        //     //     "enc_right distance: {} m, velocity: {} m/s",
+        //     //     enc_right_distance_m, enc_right_velocity_mps
+        //     // );
+        //
+        //     let enc_left_now = enc_left.count();
+        //     let enc_left_diff: i32;
+        //
+        //     if (enc_left_now as i32 - enc_left_prev as i32).abs() >= 10000 {
+        //         info!("too big!");
+        //         continue;
+        //     } else {
+        //         enc_left_diff = enc_left_now as i32 - enc_left_prev as i32;
+        //     }
+        //
+        //     // if enc_left_now >= enc_left_prev {
+        //     //     enc_left_diff = enc_left_now as i32 - enc_left_prev as i32;
+        //     // } else {
+        //     //     enc_left_diff = (enc_left_now as i32) + (ENCODER_MAX as i32 + 1 - enc_left_prev as i32);
+        //     // }
+        //     enc_left_prev = enc_left_now;
+        //     enc_left_pos += enc_left_diff;
+        //     let enc_left_vel = enc_left_diff as f32 / dt_s;
+        //
+        //     let enc_left_distance_m = enc_left_pos as f32 / ticks_per_meter;
+        //     let enc_left_velocity_mps = enc_left_vel / ticks_per_meter;
+        //     // info!(
+        //     //     "enc_left distance: {} m, velocity: {} m/s",
+        //     //     enc_left_distance_m, enc_left_velocity_mps
+        //     // );
+        //
+        //     let enc_left_dir = 1;
+        //
+        //     info!(
+        //         "enc_right -> prev: {}, now: {}, diff: {}, pos: {}, vel {} ticks/s, dir: {}",
+        //         enc_right_prev,
+        //         enc_right_now,
+        //         enc_right_diff,
+        //         enc_right_pos,
+        //         enc_right_vel,
+        //         enc_right_dir
+        //     );
+        //
+        //     info!(
+        //         "enc_left -> prev: {}, now: {}, diff: {}, pos: {}, vel {} ticks/s, dir: {}",
+        //         enc_left_prev, enc_left_now, enc_left_diff, enc_left_pos, enc_left_vel, enc_left_dir
+        //     );
+        //
+        //     let effort_left = pid_left
+        //         .next_control_output(target_ticks - enc_left_pos as f32)
+        //         .output;
+        //
+        //     let effort_right = pid_right
+        //         .next_control_output(target_ticks - enc_right_pos as f32)
+        //         .output;
+        //
+        //     let duty_left = duty_from_effort(effort_left);
+        //
+        //     let duty_right = duty_from_effort(effort_right);
+        //
+        //     if enc_left_dir == 1 {
+        //         pwm_fwd!(left_pwm, duty_left);
+        //     } else {
+        //         pwm_rev!(left_pwm, duty_left);
+        //     }
+        //
+        //     if enc_right_dir == 1 {
+        //         pwm_fwd!(right_pwm, duty_right);
+        //     } else {
+        //         pwm_rev!(right_pwm, duty_right);
+        //     }
+        //
+        //     if (enc_left_pos as f32) >= target_ticks && (enc_right_pos as f32) >= target_ticks {
+        //         pwm_off!(left_pwm);
+        //         pwm_off!(right_pwm);
+        //         info!("done!");
+        //         break;
+        //     }
+
+        //
+        // if phase_remaining_ms > 0 {
+        //     phase_remaining_ms -= period_ms;
+        // } else {
+        //     match phase {
+        //         Phase::Forward => {
+        //             target_l = 0.0;
+        //             target_r = 0.0;
+        //             phase = Phase::Coast1;
+        //             phase_remaining_ms = COAST_TIME_MS;
+        //         }
+        //         Phase::Coast1 => {
+        //             target_l = REV_CPS;
+        //             target_r = REV_CPS;
+        //             phase = Phase::Reverse;
+        //             phase_remaining_ms = REV_TIME_MS;
+        //         }
+        //         Phase::Reverse => {
+        //             target_l = 0.0;
+        //             target_r = 0.0;
+        //             phase = Phase::Coast2;
+        //             phase_remaining_ms = COAST_TIME_MS;
+        //         }
+        //         Phase::Coast2 => {
+        //             target_l = FWD_CPS;
+        //             target_r = FWD_CPS;
+        //             phase = Phase::Forward;
+        //             phase_remaining_ms = FWD_TIME_MS;
+        //         }
+        //     }
+        // }
+    }
+
+    loop {
+        pwm_off!(right_pwm);
+        pwm_off!(left_pwm);
     }
 }
