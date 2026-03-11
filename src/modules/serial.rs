@@ -1,19 +1,35 @@
-// Serial interface module using Embassy
-use embassy_stm32::usart::{Usart, Config as UsartConfig};
-use embassy_stm32::peripherals::{USART, Pin};
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::usart::{Config, ConfigError, Instance, RxPin, TxPin, Uart};
+use embassy_stm32::Peri;
+use embedded_hal_nb::serial::Read as _;
 
-pub struct SerialInterface<'a> {
-    pub usart: Usart<'a>,
+/// Minimal bidirectional serial interface (blocking write + nonblocking read).
+pub struct SerialInterface<'d> {
+    uart: Uart<'d, Blocking>,
 }
 
-impl<'a> SerialInterface<'a> {
-    pub fn new(usart_periph: USART, tx_pin: Pin, rx_pin: Pin) -> Self {
-        let config = UsartConfig::default();
-        let usart = Usart::new(usart_periph, tx_pin, rx_pin, config);
-        SerialInterface { usart }
+impl<'d> SerialInterface<'d> {
+    pub fn new<T: Instance>(
+        peri: Peri<'d, T>,
+        rx: Peri<'d, impl RxPin<T>>,
+        tx: Peri<'d, impl TxPin<T>>,
+        config: Config,
+    ) -> Result<Self, ConfigError> {
+        let uart = Uart::new_blocking(peri, rx, tx, config)?;
+        Ok(Self { uart })
     }
 
-    pub async fn send(&mut self, data: &[u8]) {
-        let _ = self.usart.write(data).await;
+    pub fn write(&mut self, bytes: &[u8]) {
+        // Best-effort: if TX errors happen, we keep running the control loop.
+        let _ = self.uart.blocking_write(bytes);
+    }
+
+    /// Read one byte if available.
+    pub fn try_read(&mut self) -> Option<u8> {
+        match self.uart.read() {
+            Ok(b) => Some(b),
+            Err(nb::Error::WouldBlock) => None,
+            Err(nb::Error::Other(_e)) => None,
+        }
     }
 }
